@@ -1,0 +1,28 @@
+// Moonloops <-> Supabase (plain fetch, no libraries). Active only when config.js has a url and key.
+const CFG=window.MOONLOOPS||{},REMOTE=!!(CFG.url&&CFG.key);
+let SESS=null;try{SESS=JSON.parse(localStorage.getItem('ml_sess'))}catch{}
+let RP={},RO={},Q=Promise.resolve();
+function setSess(j){SESS=j&&j.access_token?{at:j.access_token,rt:j.refresh_token,exp:j.expires_at||Math.floor(Date.now()/1000)+(j.expires_in||3600)}:null;try{SESS?localStorage.setItem('ml_sess',JSON.stringify(SESS)):localStorage.removeItem('ml_sess')}catch{}}
+async function refreshSess(){try{const r=await fetch(CFG.url+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{apikey:CFG.key,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:SESS.rt})});setSess(r.ok?await r.json():null)}catch{}}
+const hdr=async(extra={})=>{if(SESS&&SESS.rt&&SESS.exp-60<Date.now()/1000)await refreshSess();const h={apikey:CFG.key,'Content-Type':'application/json',...extra};if(SESS)h.Authorization='Bearer '+SESS.at;return h};
+async function api(path,{method='GET',body,prefer}={}){const r=await fetch(CFG.url+path,{method,headers:await hdr(prefer?{Prefer:prefer}:{}),body:body===undefined?undefined:JSON.stringify(body)});if(!r.ok){let m='';try{m=(await r.json()).message||''}catch{}throw new Error(m||'HTTP '+r.status)}const t=await r.text();return t?JSON.parse(t):null}
+const rest=(p,o)=>api('/rest/v1/'+p,o);
+const rpc=(fn,args)=>api('/rest/v1/rpc/'+fn,{method:'POST',body:args||{}});
+async function signIn(email,pw){const r=await fetch(CFG.url+'/auth/v1/token?grant_type=password',{method:'POST',headers:{apikey:CFG.key,'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error_description||j.msg||'Wrong email or password');setSess(j)}
+const signOut=()=>setSess(null);
+const fromRow=r=>({id:r.id,name:r.name,price:+r.price,cat:r.cat,emoji:r.emoji,desc:r.descr,stock:r.stock,active:r.active,feat:r.feat,tags:r.tags||[],cross:r.cross_ids||[],up:r.up||'',imgs:r.imgs||[],img:(r.imgs||[])[0]||''});
+const toRow=p=>({id:p.id,name:p.name,price:p.price,cat:p.cat,emoji:p.emoji||'🧶',descr:p.desc||'',stock:p.stock,active:p.active!==false,feat:!!p.feat,tags:p.tags||[],cross_ids:p.cross||[],up:p.up||null,imgs:gl(p)});
+const toOrderRow=o=>({id:o.id,status:o.status,phone:o.phone,data:o});
+const queue=f=>{Q=Q.then(f).catch(e=>toast('Could not save to the shop: '+e.message))};
+async function pushProducts(list){const rows=list.map(toRow),ch=rows.filter(r=>RP[r.id]!==JSON.stringify(r));if(ch.length){await rest('products?on_conflict=id',{method:'POST',body:ch,prefer:'resolution=merge-duplicates,return=minimal'});ch.forEach(r=>RP[r.id]=JSON.stringify(r))}const gone=Object.keys(RP).filter(id=>!rows.some(r=>r.id==id));if(gone.length){await rest('products?id=in.('+gone.join(',')+')',{method:'DELETE'});gone.forEach(id=>delete RP[id])}}
+async function pushOrders(list){const rows=list.map(toOrderRow),ch=rows.filter(r=>RO[r.id]!==JSON.stringify(r));if(ch.length){await rest('orders?on_conflict=id',{method:'POST',body:ch,prefer:'resolution=merge-duplicates,return=minimal'});ch.forEach(r=>RO[r.id]=JSON.stringify(r))}}
+const pushData=(key,value)=>rest('shop_data?on_conflict=key',{method:'POST',body:{key,value},prefer:'resolution=merge-duplicates,return=minimal'});
+function syncUp(k,v){queue(async()=>{if(k=='products')await pushProducts(v);else if(k=='orders')await pushOrders(v);else if(k=='cfg'){const {user,pass,...c}=v;await pushData('cfg',c)}else await pushData(k,v)})}
+async function refreshProducts(){const rows=await rest('products?select=*&order=created_at.asc,id.asc');products=rows.map(fromRow);RP={};products.forEach(p=>{RP[p.id]=JSON.stringify(toRow(p))});TRN=trending()}
+async function loadOrders(){const rows=await rest('orders?select=id,status,data&order=created_at.asc');orders=rows.map(r=>({...r.data,id:r.id,status:r.status}));RO={};orders.forEach(o=>{RO[o.id]=JSON.stringify(toOrderRow(o))})}
+async function loadRemote(){const [pr,sd,st]=await Promise.all([rest('products?select=*&order=created_at.asc,id.asc'),rest('shop_data?select=key,value'),rpc('shop_stats').catch(()=>null)]);
+ products=pr.map(fromRow);RP={};products.forEach(p=>{RP[p.id]=JSON.stringify(toRow(p))});const d=Object.fromEntries(sd.map(r=>[r.key,r.value]));
+ if(d.cfg)Object.assign(cfg,d.cfg);promos=d.promos||[];bundles=d.bundles||[];if(st)stats={sold:st.sold||{},bought:st.bought||{},views:st.views||{},co:st.co||{}}}
+async function placeRemote(ord){try{const r=await rpc('place_order',{p:ord});cart=[];save('cart',cart);await refreshProducts().catch(()=>{});location.hash='#/done/'+r.id}catch(e){toast(/stock|available/i.test(e.message)?'Sorry, something just sold out. Please check your cart.':'Could not place the order: '+e.message);await refreshProducts().catch(()=>{});route()}}
+async function upBlob(dataUrl){const blob=await (await fetch(dataUrl)).blob(),name=Date.now()+'-'+Math.random().toString(36).slice(2,8)+'.jpg';const r=await fetch(CFG.url+'/storage/v1/object/product-images/'+name,{method:'POST',headers:await hdr({'Content-Type':'image/jpeg','x-upsert':'true'}),body:blob});if(!r.ok)throw new Error('Photo upload failed');return CFG.url+'/storage/v1/object/public/product-images/'+name}
+async function boot(){if(REMOTE){app.innerHTML='<p style="text-align:center;padding:60px">Loading Moonloops… 🌙</p>';try{await loadRemote();if(SESS){admin=!!(await rpc('is_admin').catch(()=>false));if(admin)await loadOrders();else signOut()}}catch(e){console.error(e);app.innerHTML='<div class="panel" style="text-align:center"><h2>The shop is taking a nap 😴</h2><p>Please try again in a moment.</p></div>';return}}route()}
